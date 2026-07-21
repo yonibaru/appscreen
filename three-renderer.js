@@ -36,6 +36,12 @@ const deviceConfigs = {
         screenOffset: { x: 0.027, y: 0.745, z: 0.098 },
         positionOffsetFactor: 0.81,
         cornerRadiusFactor: 0.16,
+        // Per-axis oversize of the screen plane so its edges reach the frame
+        // opening without spilling onto the metal. The display renders a touch
+        // wider than the plane (left/right rim) but slightly taller top/bottom,
+        // so widen x and pull y in. Any thin residual gap is hidden by the
+        // darkened glass (see darkenPhoneGlass); overshoot onto metal is not.
+        screenBleed: { x: 0.01, y: -0.005 },
         modelRotation: { x: 0, y: 0, z: 0 }  // No correction needed
     },
     samsung: {
@@ -45,6 +51,7 @@ const deviceConfigs = {
         screenOffset: { x: 0, y: 0.0, z: 0.08},  // Will need adjustment
         positionOffsetFactor: 0.5,
         cornerRadiusFactor: 0.04,
+        screenBleed: { x: 0.01, y: 0 },
         modelRotation: { x: 0, y: 0, z: 0 }  // Adjust to correct model tilt (in degrees)
     }
 };
@@ -90,6 +97,20 @@ var frameColorPresets = {
 
 // Store original material colors for the current model
 let originalMaterialColors = {};
+
+// The phone models ship a front "glass" material that is a light-grey,
+// semi-transparent layer. Because the screen plane sits just in front of it, the
+// glass is the frontmost surface in the thin seam between the screenshot and the
+// frame, so it composites over the background as an ugly light rim. Darkening it
+// makes any residual seam read as a natural black bezel instead of a white line.
+function darkenPhoneGlass(model) {
+    if (!model) return;
+    model.traverse((child) => {
+        if (child.isMesh && child.material && (child.material.name || '').toLowerCase() === 'glass') {
+            child.material.color.setRGB(0.02, 0.02, 0.02);
+        }
+    });
+}
 
 // Apply a frame color preset to the phone model
 function setPhoneFrameColor(presetId, deviceType) {
@@ -306,6 +327,9 @@ function loadPhoneModel() {
             phonePivot.add(phoneModel);
             threeScene.add(phonePivot);
 
+            // Darken the front glass so it doesn't show as a light seam rim
+            darkenPhoneGlass(phoneModel);
+
             // Create a custom screen plane overlay since the model's UV mapping may be incorrect
             createScreenOverlay();
 
@@ -422,6 +446,9 @@ function switchPhoneModel(deviceType) {
             phonePivot.add(phoneModel);
             threeScene.add(phonePivot);
 
+            // Darken the front glass so it doesn't show as a light seam rim
+            darkenPhoneGlass(phoneModel);
+
             // Create screen overlay for this device
             createScreenOverlay();
 
@@ -495,6 +522,9 @@ function loadCachedPhoneModel(deviceType) {
                 const modelBaseScale = 3.75 / maxDim;
                 model.scale.setScalar(modelBaseScale);
 
+                // Darken the front glass so it doesn't show as a light seam rim
+                darkenPhoneGlass(model);
+
                 // Create pivot for this model
                 const screenOffset = config.screenOffset;
                 const pivot = new THREE.Group();
@@ -507,10 +537,14 @@ function loadCachedPhoneModel(deviceType) {
 
                 pivot.add(model);
 
-                // Create screen plane for this model
+                // Create screen plane for this model (oversized per-axis by
+                // screenBleed so it meets the frame without spilling onto metal)
                 const aspectRatio = config.aspectRatio;
-                const planeHeight = 4.3 * config.screenHeightFactor;
-                const planeWidth = planeHeight * aspectRatio;
+                const bleedX = 1 + (config.screenBleed?.x || 0);
+                const bleedY = 1 + (config.screenBleed?.y || 0);
+                const baseHeight = 4.3 * config.screenHeightFactor;
+                const planeHeight = baseHeight * bleedY;
+                const planeWidth = baseHeight * aspectRatio * bleedX;
 
                 const geometry = new THREE.PlaneGeometry(planeWidth, planeHeight);
                 const material = new THREE.MeshBasicMaterial({
@@ -572,10 +606,15 @@ function createScreenOverlay() {
 
     const config = deviceConfigs[currentDeviceModel] || deviceConfigs.iphone;
 
-    // Use device-specific aspect ratio and screen size
+    // Use device-specific aspect ratio and screen size, oversized per-axis by
+    // screenBleed so the screen meets the frame opening without spilling onto the
+    // metal. Width and height bleed independently (display aspect != screenshot).
     const aspectRatio = config.aspectRatio;
-    const planeHeight = 4.3 * config.screenHeightFactor;
-    const planeWidth = planeHeight * aspectRatio;
+    const bleedX = 1 + (config.screenBleed?.x || 0);
+    const bleedY = 1 + (config.screenBleed?.y || 0);
+    const baseHeight = 4.3 * config.screenHeightFactor;
+    const planeHeight = baseHeight * bleedY;
+    const planeWidth = baseHeight * aspectRatio * bleedX;
 
     const geometry = new THREE.PlaneGeometry(planeWidth, planeHeight);
     const material = new THREE.MeshBasicMaterial({
@@ -639,6 +678,37 @@ function createRoundedScreenImage(image, cornerRadius) {
     return canvas;
 }
 
+// Apply high-quality sampling to a screen texture: linear filtering plus max
+// anisotropy so the screenshot stays crisp at oblique angles, and no mipmaps so
+// non-power-of-two screenshots aren't rescaled (which softens/jaggeds the edges).
+function configureScreenTexture(texture) {
+    texture.needsUpdate = true;
+    texture.encoding = THREE.sRGBEncoding;
+    texture.flipY = true;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.generateMipmaps = false;
+    if (threeRenderer && threeRenderer.capabilities) {
+        texture.anisotropy = threeRenderer.capabilities.getMaxAnisotropy();
+    }
+}
+
+// Supersampling factor for the composited/export render. Rendering the 3D scene
+// above the target resolution and downscaling anti-aliases both the phone
+// geometry AND the screenshot's alpha edges (WebGL MSAA can't smooth texture
+// transparency). Falls back to 1x while dragging so interaction stays snappy,
+// and is capped by the GPU's max texture size.
+function getSuperSampleFactor(width, height) {
+    if (isDragging3D) return 1;
+    const maxTex = (threeRenderer && threeRenderer.capabilities &&
+        threeRenderer.capabilities.maxTextureSize) || 4096;
+    let factor = 2;
+    while (factor > 1 && (width * factor > maxTex || height * factor > maxTex)) {
+        factor--;
+    }
+    return factor;
+}
+
 // Update the screen texture with current screenshot
 function updateScreenTexture() {
     if (!phoneModel) return;
@@ -662,9 +732,7 @@ function updateScreenTexture() {
     const roundedImage = createRoundedScreenImage(screenshotImage, cornerRadius);
 
     screenTexture = new THREE.Texture(roundedImage);
-    screenTexture.needsUpdate = true;
-    screenTexture.encoding = THREE.sRGBEncoding;
-    screenTexture.flipY = true;
+    configureScreenTexture(screenTexture);
 
     // Create a material for the screen with transparency for rounded corners
     const screenMaterial = new THREE.MeshBasicMaterial({
@@ -783,9 +851,13 @@ function renderThreeJSToCanvas(targetCanvas, width, height) {
     threeScene.background = null;
     threeRenderer.setClearColor(0x000000, 0); // Fully transparent clear color
 
-    // Temporarily resize renderer
+    // Temporarily resize renderer, supersampling above the target resolution so
+    // the downscale anti-aliases both the phone edges and the screenshot corners.
     const oldSize = { width: 400, height: 700 };
-    threeRenderer.setSize(dims.width, dims.height);
+    const ssaa = getSuperSampleFactor(dims.width, dims.height);
+    const renderW = dims.width * ssaa;
+    const renderH = dims.height * ssaa;
+    threeRenderer.setSize(renderW, renderH);
     threeCamera.aspect = dims.width / dims.height;
     threeCamera.updateProjectionMatrix();
 
@@ -795,9 +867,12 @@ function renderThreeJSToCanvas(targetCanvas, width, height) {
     // Render with transparency
     threeRenderer.render(threeScene, threeCamera);
 
-    // Draw to target canvas (compositing the 3D phone onto existing content)
+    // Draw to target canvas (compositing the 3D phone onto existing content),
+    // downscaling the supersampled render with high-quality smoothing.
     const ctx = targetCanvas.getContext('2d');
-    ctx.drawImage(threeRenderer.domElement, 0, 0, dims.width, dims.height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(threeRenderer.domElement, 0, 0, renderW, renderH, 0, 0, dims.width, dims.height);
 
     // Restore size, background, and model transforms
     threeRenderer.setSize(oldSize.width, oldSize.height);
@@ -873,9 +948,7 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
         const cornerRadius = Math.round(screenshotImage.width * config.cornerRadiusFactor);
         const roundedImage = createRoundedScreenImage(screenshotImage, cornerRadius);
         const newTexture = new THREE.Texture(roundedImage);
-        newTexture.needsUpdate = true;
-        newTexture.encoding = THREE.sRGBEncoding;
-        newTexture.flipY = true;
+        configureScreenTexture(newTexture);
 
         const newMaterial = new THREE.MeshBasicMaterial({
             map: newTexture,
@@ -920,9 +993,13 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
     threeScene.background = null;
     threeRenderer.setClearColor(0x000000, 0); // Fully transparent clear color
 
-    // Temporarily resize renderer
+    // Temporarily resize renderer, supersampling above the target resolution so
+    // the downscale anti-aliases both the phone edges and the screenshot corners.
     const oldSize = { width: 400, height: 700 };
-    threeRenderer.setSize(dims.width, dims.height);
+    const ssaa = getSuperSampleFactor(dims.width, dims.height);
+    const renderW = dims.width * ssaa;
+    const renderH = dims.height * ssaa;
+    threeRenderer.setSize(renderW, renderH);
     threeCamera.aspect = dims.width / dims.height;
     threeCamera.updateProjectionMatrix();
 
@@ -932,9 +1009,12 @@ function renderThreeJSForScreenshot(targetCanvas, width, height, screenshotIndex
     // Render with transparency
     threeRenderer.render(threeScene, threeCamera);
 
-    // Draw to target canvas (composite 3D phone onto existing background)
+    // Draw to target canvas (composite 3D phone onto existing background),
+    // downscaling the supersampled render with high-quality smoothing.
     const ctx = targetCanvas.getContext('2d');
-    ctx.drawImage(threeRenderer.domElement, 0, 0, dims.width, dims.height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(threeRenderer.domElement, 0, 0, renderW, renderH, 0, 0, dims.width, dims.height);
 
     // Restore everything
     threeRenderer.setSize(oldSize.width, oldSize.height);
@@ -1137,6 +1217,11 @@ function setup3DCanvasInteraction() {
             isDragging3D = false;
             isAltDragging = false;
             canvas.style.cursor = getUse3D() ? 'grab' : '';
+            // Drag renders at 1x for speed; re-render once at full supersampled
+            // quality now that interaction has settled.
+            if (typeof updateCanvas === 'function') {
+                updateCanvas();
+            }
         }
     });
 
